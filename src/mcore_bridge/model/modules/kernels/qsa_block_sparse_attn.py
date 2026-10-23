@@ -79,7 +79,7 @@ def _qsa_bs_fwd_kernel(
     BLK: tl.constexpr,
 ):
     # The selection bitmap exceeds 2 GiB at long context lengths.
-    pid_t = tl.program_id(0).to(tl.int64)
+    pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
     kv_head = pid_h // GROUP
 
@@ -106,7 +106,7 @@ def _qsa_bs_fwd_kernel(
     # over the tile's queries; per-query exactness comes from the mask below.
     n_tiles = tl.load(KCNT + pid_t)
     for i in range(0, n_tiles):
-        kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
+        kt = tl.load(KLIST + pid_t * stride_kl + i)
         offs_k = kt * BK + tl.arange(0, BK)
         k_in = offs_k < T
 

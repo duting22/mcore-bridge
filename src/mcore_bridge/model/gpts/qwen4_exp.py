@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import math
-import megatron.core
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -16,7 +15,7 @@ from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_par
                                                     scatter_to_sequence_parallel_region)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.utils import make_viewless_tensor
 from torch import nn
@@ -322,25 +321,76 @@ class Qwen4ExpMTPStreamNorm(nn.Module):
         return ((1.0 + self.weight.float()) * x).to(input_dtype)
 
 
+def _has_native_split_mtp_projection(submodules) -> bool:
+    """Whether Megatron declares split MTP projections in its submodule dataclass.
+
+    Check the class-level dataclass fields rather than instance attributes: the 0.16 compatibility
+    path attaches e_proj/h_proj dynamically, and those attributes must not make it look native.
+    """
+    fields = getattr(type(submodules), '__dataclass_fields__', {})
+    return 'e_proj' in fields and 'h_proj' in fields
+
+
 class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
     """Qwen3.8-Flash-Next MTP head: the ``residual_linear_shared`` fusion over the gated-HC backbone.
 
-    The backbone runs Qwen4Exp's own gated hyper-connections (``hc_count`` streams) but NOT Megatron's
-    ``enable_hyper_connections`` mHC. The MTP head still needs Megatron's mHC *projection* form
-    (separate ``e_proj``/``h_proj`` rather than a fused ``eh_proj``), because the checkpoint stores
-    ``fc_embedding``/``fc_hidden`` (H->H each) and adds the embedding residual to every stream. So the
-    subtree is built with hyper-connections enabled via a config copy -- which selects e_proj/h_proj --
-    then Megatron's mHC-only contraction params (``hc_head_*``) and ``final_layernorm`` are dropped in
-    favour of Qwen4Exp's own ``hyper_connection_mixer``, matching the checkpoint and the vLLM draft
-    model. ``_concat_embeddings`` normalizes the multi-stream jointly (``Qwen4ExpMTPStreamNorm``) and
-    ``_postprocess`` contracts with the mixer, so the layer returns the multi-stream and the MTP block
-    applies ``_postprocess`` for the loss head.
+    The backbone runs Qwen4Exp's own gated hyper-connections (``hc_count`` streams), not Megatron's
+    mHC implementation. The checkpoint stores separate ``fc_embedding``/``fc_hidden`` projections
+    (H->H each). Megatron versions that expose native split MTP projections retain their original
+    construction path; Megatron-Core 0.16 gets the same modules from a bridge compatibility path after
+    its mandatory fused ``eh_proj`` construction is replaced with an identity. ``_concat_embeddings``
+    always follows the checkpoint's split-projection semantics, and ``_postprocess`` contracts with
+    Qwen4Exp's own mixer exactly once for the loss head.
     """
 
     def __init__(self, config, submodules, *args, **kwargs):
         mtp_config = copy.copy(config)
-        mtp_config.enable_hyper_connections = True
-        super().__init__(mtp_config, submodules, *args, **kwargs)
+        if _has_native_split_mtp_projection(submodules):
+            # Preserve the original Megatron-main path: the parent creates e_proj/h_proj and sets its own multi-stream forward state.
+            mtp_config.enable_hyper_connections = True
+            super().__init__(mtp_config, submodules, *args, **kwargs)
+        else:
+            # Megatron-Core 0.16 unconditionally constructs eh_proj. 
+            # An IdentityOp lets the parent set up norms, process groups, and the inner transformer layer without allocating the wrong 2H->H projection. Restore the shared spec because another build may reuse it.
+            pg_collection = kwargs.get('pg_collection')
+            if pg_collection is None and len(args) > 2:
+                pg_collection = args[2]
+            eh_proj = submodules.eh_proj
+            submodules.eh_proj = IdentityOp
+            try:
+                super().__init__(mtp_config, submodules, *args, **kwargs)
+            finally:
+                submodules.eh_proj = eh_proj
+
+            # 0.16 only retains cp_group on the parent layer; keep its TP group for the split projections and for this class's gather/scatter operations. 
+            # Passing None deliberately preserves Megatron's fallback to the globally initialized TP group.
+            self.tp_group = getattr(pg_collection, 'tp', None)
+            projection_kwargs = {
+                'config': self.config,
+                'init_method': self.config.init_method,
+                'gather_output': False,
+                'bias': False,
+                'skip_bias_add': False,
+                'is_expert': False,
+                'tp_group': self.tp_group,
+            }
+            self.e_proj = build_module(
+                submodules.e_proj,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                tp_comm_buffer_name='mtp_e_proj',
+                **projection_kwargs,
+            )
+            self.h_proj = build_module(
+                submodules.h_proj,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                tp_comm_buffer_name='mtp_h_proj',
+                **projection_kwargs,
+            )
+            self.eh_proj = None
+            # Bridge-local control only: keep n*H until the MTP block invokes the Qwen mixer.
+            self.mhc_enabled = True
         for name in ('hc_head_fn', 'hc_head_base', 'hc_head_scale', 'final_layernorm'):
             if hasattr(self, name):
                 delattr(self, name)
@@ -764,15 +814,7 @@ class Qwen4ExpLoader(ModelLoader):
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 sub = layer_spec.submodules
-                # The residual_linear_shared head needs Megatron's mHC *projection* form (separate
-                # e_proj/h_proj slots). megatron-core <= 0.18 only has the fused eh_proj slot, and
-                # assigning e_proj/h_proj there would silently no-op and surface later as an
-                # AttributeError on self.e_proj -- so reject early and name the fix.
-                if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
-                    raise NotImplementedError(
-                        'Qwen3.8-Flash-Next MTP requires a Megatron whose MultiTokenPredictionLayerSubmodules '
-                        'exposes e_proj/h_proj (megatron-core >= 0.19 / dev); got '
-                        f'{megatron.core.__version__}.')
+                native_split_proj = _has_native_split_mtp_projection(sub)
                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm
@@ -785,7 +827,15 @@ class Qwen4ExpLoader(ModelLoader):
                 sub.layer_norm = TENorm
                 # The MTP inner block is always full-attention (config.mtp.layer_types), independent of
                 # the backbone layer numbering that Qwen4ExpLayer would otherwise read.
-                sub.mtp_model_layer.module = Qwen4ExpMTPInnerLayer
+                preferred_inner_name = 'mtp_model_layer' if native_split_proj else 'transformer_layer'
+                fallback_inner_name = 'transformer_layer' if native_split_proj else 'mtp_model_layer'
+                inner_layer = getattr(sub, preferred_inner_name, None)
+                if inner_layer is None:
+                    inner_layer = getattr(sub, fallback_inner_name, None)
+                if inner_layer is None:
+                    raise RuntimeError(
+                        'Unsupported Megatron MTP spec: neither mtp_model_layer nor transformer_layer is present.')
+                inner_layer.module = Qwen4ExpMTPInnerLayer
         return mtp_block_spec
 
     def build_model(

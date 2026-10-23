@@ -12,6 +12,7 @@ from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from packaging import version
 from transformers import set_seed
+from transformers.utils import is_torch_npu_available
 from typing import Optional
 
 from .logger import get_logger
@@ -115,6 +116,161 @@ def get_num_samples(packed_seq_params) -> int:
     return int(packed_seq_params.cu_seqlens_q.numel()) - 1
 
 
+def _thd_partitioned_indices_torch(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device,
+) -> torch.Tensor:
+    """Pure-Torch equivalent of TE's thd_get_partitioned_indices."""
+
+    cu = cu_seqlens.reshape(-1).to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    starts = cu[:-1]
+    ends = cu[1:]
+    seq_lens = ends - starts
+
+    if torch.any(seq_lens <= 0):
+        raise RuntimeError(
+            f"THD CP requires positive sequence lengths, got {seq_lens}"
+        )
+
+    divisor = 2 * cp_size
+    if torch.any(seq_lens % divisor != 0):
+        raise RuntimeError(
+            "THD CP requires every packed sequence length to be "
+            f"divisible by 2*cp_size={divisor}, "
+            f"got lengths={seq_lens}"
+        )
+
+    chunk = seq_lens // divisor
+
+    # Rank r owns:
+    #   front chunk r
+    #   back  chunk (2*cp_size-r-1)
+    front_starts = starts + cp_rank * chunk
+    back_starts = ends - (cp_rank + 1) * chunk
+
+    seg_starts = torch.stack(
+        (front_starts, back_starts),
+        dim=1,
+    ).reshape(-1)
+
+    seg_lens = torch.stack(
+        (chunk, chunk),
+        dim=1,
+    ).reshape(-1)
+
+    # Expand [segment_start, segment_length]
+    # into token indices without Python-side per-token loops.
+    nz = seg_lens > 0
+    seg_starts = seg_starts[nz]
+    seg_lens = seg_lens[nz]
+
+    seg_ids = torch.repeat_interleave(
+        torch.arange(
+            seg_lens.numel(),
+            device=device,
+            dtype=torch.long,
+        ),
+        seg_lens,
+    )
+
+    prefix = torch.cumsum(seg_lens, dim=0) - seg_lens
+
+    offsets = torch.arange(
+        int(seg_lens.sum().item()),
+        device=device,
+        dtype=torch.long,
+    )
+
+    offsets -= torch.repeat_interleave(
+        prefix,
+        seg_lens,
+    )
+
+    return seg_starts.index_select(0, seg_ids) + offsets
+
+
+def _undo_attention_load_balancing_thd_torch(
+    input_: torch.Tensor,
+    cp_size: int,
+    packed_seq_params,
+) -> torch.Tensor:
+
+    cu = packed_seq_params.cu_seqlens_q_padded
+
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
+
+    if cu is None:
+        raise RuntimeError(
+            "THD CP reconstruction requires "
+            "cu_seqlens_q_padded or cu_seqlens_q."
+        )
+
+    total_tokens = input_.shape[0]
+
+    cu = cu.reshape(-1)
+
+    if int(cu[-1].item()) != total_tokens:
+        raise RuntimeError(
+            "THD CP metadata does not match gathered tensor: "
+            f"cu[-1]={int(cu[-1].item())}, "
+            f"total_tokens={total_tokens}"
+        )
+
+    # gathered layout is:
+    #
+    #   [rank0_local,
+    #    rank1_local,
+    #    ...
+    #    rankN_local]
+    #
+    # Build the global token positions represented by each row.
+    rank_major_positions = torch.cat(
+        [
+            _thd_partitioned_indices_torch(
+                cu,
+                cp_size,
+                rank,
+                input_.device,
+            )
+            for rank in range(cp_size)
+        ],
+        dim=0,
+    )
+
+    if rank_major_positions.numel() != total_tokens:
+        raise RuntimeError(
+            "Invalid THD CP reconstruction index size: "
+            f"{rank_major_positions.numel()} vs {total_tokens}"
+        )
+
+    # rank_major_positions[j] means: gathered[j] belongs to global position rank_major_positions[j].
+    # Build inverse permutation so that: output[global_position] = gathered[j]
+    restore_order = torch.empty(
+        total_tokens,
+        dtype=torch.long,
+        device=input_.device,
+    )
+
+    restore_order.scatter_(
+        0,
+        rank_major_positions,
+        torch.arange(
+            total_tokens,
+            device=input_.device,
+            dtype=torch.long,
+        ),
+    )
+
+    return input_.index_select(0, restore_order)
+
+
 def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode: str = 'zigzag') -> torch.Tensor:
     """In CP mode, all-gather and undo the chunking produced by
     ``split_cp_inputs``, restoring the full sequence in original token order
@@ -163,7 +319,20 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode
     # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
     if dim != 0:
         gathered = gathered.transpose(0, dim).contiguous()
-    out = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+    if packed_seq_params is not None and is_torch_npu_available():
+        # THD path: TE-free implementation for NPU.
+        out = _undo_attention_load_balancing_thd_torch(
+            gathered,
+            cp_size,
+            packed_seq_params,
+        )
+    else:
+        out = _undo_attention_load_balancing(
+            gathered,
+            cp_size,
+            packed_seq_params,
+        )
+
     if dim != 0:
         out = out.transpose(0, dim).contiguous()
     return out
