@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import os
 import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
@@ -132,6 +133,9 @@ class QSAIndexer(nn.Module):
         self.compress_ratio = config.indexer_compress_ratio
         self.token_budget = config.indexer_budget
         self.block_topk = self.token_budget // self.compress_ratio
+        self.indexer_backend = os.environ.get('QSA_INDEXER_BACKEND', 'torch').strip().lower()
+        if self.indexer_backend not in ('torch', 'ascendc'):
+            raise ValueError(f'Unknown QSA_INDEXER_BACKEND={self.indexer_backend!r}.')
         self.index_qk_proj = TELinear(
             input_size=config.hidden_size,
             output_size=(self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
@@ -184,6 +188,8 @@ class QSAIndexer(nn.Module):
             ``top_blocks``/``keep`` are ``[b, s, k]`` (``k =
             min(block_topk, max_blocks)``) and ``n_blocks`` is ``[s]``.
         """
+        if self.indexer_backend != 'torch':
+            raise NotImplementedError('QSA_INDEXER_BACKEND=ascendc currently requires packing/padding_free THD.')
         s, b, _ = hidden_states.shape
         R = self.compress_ratio
         max_blocks = s // R
@@ -413,8 +419,14 @@ class QSAIndexer(nn.Module):
 
         # ---- score only in-document blocks, chunked over queries ----
         q_nblocks = (pos_in_doc + 1) // R  # [T]
-        top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
-        k = top_blocks.shape[1]
+        if self.indexer_backend == 'ascendc':
+            from .kernels.qsa_npu_indexer import lightning_topk_blocks
+            k = min(self.block_topk, NB)
+            top_blocks, keep = lightning_topk_blocks(
+                q, block_keys, cu_seqlens, full_blocks, q_nblocks, k, R, _QSA_INDEX_SCORE_CHUNK_BYTES)
+        else:
+            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+            k = top_blocks.shape[1]
 
         # ---- top-k blocks -> token indices ----
         arange_r = torch.arange(R, device=device)

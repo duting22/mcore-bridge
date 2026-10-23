@@ -1,5 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""QSA sparse attention wrappers around the vendored tensor-core triton kernel.
+"""QSA core-attention adapters with selectable Triton and Ascend backends.
+
+``QSA_ATTN_BACKEND=npu_fa`` uses token-exact masks and native Ascend FA, including CP.
+The default remains the vendored Triton implementation described below.
 
 The kernel itself lives in ``qsa_block_sparse_attn.py``, adapted from
 miles PR #2777 (commit 0f5dff4). This file owns only the glue mcore needs:
@@ -24,6 +27,8 @@ WHY A KERNEL AT ALL (the decision this file encodes)
     mathematically equivalent there, and the mask path measures *faster*
     (8192: 8.4 s/it vs 25.9 s/it) because TE keeps the whole thing fused.
 """
+import os
+
 import torch
 
 from mcore_bridge.utils import get_env_args, get_logger
@@ -33,6 +38,13 @@ from .qsa_block_sparse_attn import qsa_sparse_attention_from_indices
 logger = get_logger()
 
 QSA_SPARSE_KERNEL_ENV = 'QSA_SPARSE_KERNEL'
+
+
+def qsa_attention_backend() -> str:
+    backend = os.environ.get('QSA_ATTN_BACKEND', 'triton').strip().lower()
+    if backend not in ('triton', 'npu_fa'):
+        raise ValueError(f'Unknown QSA_ATTN_BACKEND={backend!r}; choose triton or npu_fa.')
+    return backend
 
 try:
     import triton  # noqa: F401  (import guard for the vendored kernel)
@@ -46,12 +58,20 @@ def use_qsa_sparse_kernel() -> bool:
 
 
 def qsa_sparse_supported(head_dim: int) -> bool:
-    """Whether the sparse kernel can run for this head dim.
+    """Whether the requested QSA attention backend can run for this head dim.
 
-    Triton must be importable, ``head_dim`` must be a power of two (the kernel tiles
+    For Triton, ``head_dim`` must be a power of two (the kernel tiles
     the head with ``tl.arange`` blocks), and the kernel must not be disabled via
     ``QSA_SPARSE_KERNEL=0``.
     """
+    if qsa_attention_backend() == 'npu_fa':
+        if not use_qsa_sparse_kernel():
+            raise ValueError('QSA_ATTN_BACKEND=npu_fa cannot be combined with QSA_SPARSE_KERNEL=0: '
+                             'that disables QSA selection under packing.')
+        import torch_npu
+        if not torch_npu.npu.is_available() or head_dim <= 0:
+            raise RuntimeError('QSA_ATTN_BACKEND=npu_fa requires an available Ascend NPU.')
+        return True
     if not use_qsa_sparse_kernel():
         return False
     if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
@@ -171,7 +191,7 @@ def qsa_sparse_attention(q, k, v, indices, scale, block_size):
 
 
 class QSASparseCoreAttention(torch.nn.Module):
-    """Drop-in ``core_attention`` that runs the QSA sparse triton kernel.
+    """Drop-in ``core_attention`` consuming explicit QSA token selections.
 
     The selection indices ride in on the ``attention_mask`` argument (int64) --
     the one positional that mcore threads unchanged through both the plain and
@@ -195,6 +215,8 @@ class QSASparseCoreAttention(torch.nn.Module):
         # None -> resolved to 1/sqrt(head_dim) at call time, matching TE.
         self.softmax_scale = softmax_scale
         self.config = config
+        self.backend = qsa_attention_backend()
+        logger.info(f'QSA core attention backend: {self.backend}')
         # The kernel tests selection membership per block of compress_ratio
         # consecutive tokens, so this must be the same value the indexer expanded
         # its top-k blocks with -- see the contract in qsa_block_sparse_attn.py.
@@ -215,8 +237,16 @@ class QSASparseCoreAttention(torch.nn.Module):
         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
             cp_size = self.config.context_parallel_size
+            if self.backend == 'npu_fa' and attention_bias is not None:
+                raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
             if cp_size > 1:
                 out = self._forward_cp(query, key, value, attention_mask, scale, packed_seq_params)
+            elif self.backend == 'npu_fa':
+                from .qsa_npu_attention import qsa_npu_fusion_attention
+                if attention_bias is not None:
+                    raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
+                dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
+                out = qsa_npu_fusion_attention(query, key, value, attention_mask, scale, packed_seq_params, dropout)
             else:
                 out = qsa_sparse_attention(query, key, value, attention_mask, scale, self.block_size)
             # mcore's sbhd core attention returns heads flattened ([s, b, h*d]);
@@ -270,6 +300,15 @@ class QSASparseCoreAttention(torch.nn.Module):
 
         key_full = _gather_full(key)
         value_full = _gather_full(value)
+        if self.backend == 'npu_fa':
+            from .qsa_npu_attention import qsa_npu_fusion_attention
+            if q_pos.numel() != query.shape[0]:
+                raise ValueError('CP query positions do not cover the local Q tensor.')
+            local_idx = indices.index_select(0 if thd else 1, q_pos)
+            dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
+            return qsa_npu_fusion_attention(
+                query, key_full, value_full, local_idx, scale, packed_seq_params, dropout,
+                query_positions=q_pos, cp_size=cp_size)
         # The kernel derives the key bound from the query count (T, Hq, D = q.shape,
         # then `offs_k < T`), so it structurally requires len(q) == len(k). Under CP
         # the queries are a 1/cp_size shard while k/v are now full length, so scatter
