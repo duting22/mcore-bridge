@@ -22,7 +22,7 @@ from torch import nn
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, is_master
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
@@ -506,8 +506,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         return int(holder.item())
 
     def _broadcast_pp_weight(self, tensor, pp_src_rank: int):
-        """Cross-pp transfer of one exported weight through the tp-aligned pp
-        group. `tensor` is non-None only on the exporting rank (tp rank 0 of the
+        """Cross-pp transfer of one exported weight through the aligned pp
+        group. `tensor` is non-None only on the exporting rank (EP leader of the
         stage owning the PLE layer, i.e. the src of its pp group); the other pp
         members receive it. The payload is streamed through
         `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
@@ -515,7 +515,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         low-width dtype (fp8 e4m3/e5m2, int8, packed fp4, ...) is transported
         without NCCL dtype concerns; the meta carries the original shape/dtype
         for the receiver to view back. Groups whose src has nothing to transfer
-        (tp != 0 coords) exchange only the empty meta.
+        (EP non-leader coordinates) exchange only the empty meta.
         """
         meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
         dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
@@ -533,26 +533,26 @@ class Qwen4ExpBridge(Qwen3NextBridge):
 
     def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
         """Lazily export the PLE table shards one by one. On the exporting rank
-        (tp rank 0 of the owning stage) each shard is assembled by the chunked
+        (EP leader of the owning stage) each shard is assembled by the chunked
         all_reduce inside ``iter_export_table_to_hf`` and immediately streamed
         to the other pp members; on the other stages it is received as it
         arrives. Nothing accumulates: only the consumer (the safetensors
         writer) drives the pace, so no rank ever holds more than a single shard
         of the 100GB-scale table in host memory. The per-shard collectives keep
-        every rank of the tp-aligned pp groups in lockstep, exactly like the
+        every rank of the aligned pp groups in lockstep, exactly like the
         synchronous version this generator replaces.
         """
         parts = self.config.split_ngram_parts
         scale_key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
         shard_prefix = 'ple.ple_embedding.ngram_embedding'
-        # On tp != 0 ranks of the owning stage the table iterator executes the
-        # same all_reduces but yields nothing (shards exist only on tp rank 0).
+        # All EP owners consume one item per shard. Non-leaders receive None;
+        # never filter ranks before these EP and PP collectives have executed.
         table_iter = ple.ple_embedding.iter_export_table_to_hf() if ple is not None else iter(())
         for i in range(parts):
             shard = next(table_iter, (None, None))[1] if ple is not None else None
             if self.pp_size > 1:
                 shard = self._broadcast_pp_weight(shard, pp_src_rank)
-            if shard is not None:
+            if shard is not None and (not self._only_master_rank or is_master()):
                 yield f'{layer_prefix}{shard_prefix}.shard_{i}.weight', shard
         # The scale is a tiny scalar; a pickled broadcast is fine.
         scale = None
@@ -564,7 +564,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             obj = [scale]
             dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
             scale = obj[0]
-        if scale is not None:
+        if scale is not None and (not self._only_master_rank or is_master()):
             yield f'{layer_prefix}{scale_key}', scale
 
     def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool, layer_prefix: str = ''):
@@ -585,7 +585,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         # `ple` is only non-None on the pp stage owning the PLE layer, so the offload
         # flag has to be reduced across pp before it can gate the loop below -- that
         # loop runs pp collectives (broadcast_object_list) and export_table_to_hf runs
-        # tp ones, and stages disagreeing on whether to enter would deadlock.
+        # EP ones, and stages disagreeing on whether to enter would deadlock.
         ple_offloaded = self._reduce_tensor_pp_group(ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
         if to_mcore:
             # A PEFT/adapter checkpoint carries no PLE n-gram buffers -- those come from the base
