@@ -13,14 +13,26 @@ _QSA_INDEX_SCORE_CHUNK_BYTES = 1024 * 1024 * 1024
 
 class Qwen4ExpTextRMSNorm(nn.Module):
 
-    def __init__(self, dim: int, eps: float = 1e-6, dtype=None, sequence_parallel: bool = False):
+    def __init__(self,
+                 dim: int,
+                 eps: float = 1e-6,
+                 dtype=None,
+                 sequence_parallel: bool = False,
+                 use_npu_fusion_rmsnorm: bool = False):
         super().__init__()
         self.eps = eps
+        self.use_npu_fusion_rmsnorm = use_npu_fusion_rmsnorm
         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype))
         # Replicated across TP; reduce grads across TP when SP is on.
         setattr(self.weight, 'sequence_parallel', sequence_parallel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_npu_fusion_rmsnorm and x.device.type == 'npu' and x.numel() > 0:
+            import torch_npu
+
+            # Match the reference's FP32 affine and cast only after scaling.
+            out = torch_npu.npu_rms_norm(x.float(), 1.0 + self.weight.float(), epsilon=self.eps)[0]
+            return out.type_as(x)
         out = x.float()
         out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
         # zero-centered: (1 + w), and Qwen4ExpText casts after scaling
@@ -150,12 +162,14 @@ class QSAIndexer(nn.Module):
             self.index_head_dim,
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
-            sequence_parallel=config.sequence_parallel)
+            sequence_parallel=config.sequence_parallel,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         self.k_layernorm = Qwen4ExpTextRMSNorm(
             self.index_head_dim,
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
-            sequence_parallel=config.sequence_parallel)
+            sequence_parallel=config.sequence_parallel,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
         # QSA selection is non-differentiable and always runs without autograd.
         # Keep its pretrained parameters out of optimizer groups and DDP buckets.
@@ -216,7 +230,18 @@ class QSAIndexer(nn.Module):
 
         def apply_rope(t, cos_, sin_):
             t_rope, t_pass = t[..., :rot], t[..., rot:]
-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
+            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t_rope.numel() > 0:
+                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
+
+                shape = t_rope.shape
+                if t_rope.ndim == 3:
+                    # Pooled keys [B,NB,D] need a singleton head dimension.
+                    t_rope = t_rope.unsqueeze(2)
+                    cos_, sin_ = cos_.unsqueeze(2), sin_.unsqueeze(2)
+                t_rope = npu_rotary_position_embedding(
+                    t_rope.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=0).reshape(shape)
+            else:
+                t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
             return torch.cat((t_rope, t_pass), dim=-1)
 
         # queries rotate at their own position: cos [bf, s, rot] -> [bf, s, 1, rot]
@@ -393,7 +418,18 @@ class QSAIndexer(nn.Module):
 
         def apply_rope(t, cos_, sin_):
             t_rope, t_pass = t[..., :rot], t[..., rot:]
-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
+            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t_rope.numel() > 0:
+                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
+
+                # Normalize packed queries [T,N,D] and block keys [NB,D] to SBND.
+                shape = t_rope.shape
+                t_rope = t_rope.reshape(t_rope.shape[0], 1, -1, rot)
+                cos_ = cos_.reshape(cos_.shape[0], 1, -1, rot)
+                sin_ = sin_.reshape(sin_.shape[0], 1, -1, rot)
+                t_rope = npu_rotary_position_embedding(
+                    t_rope.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=0).reshape(shape)
+            else:
+                t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
             return torch.cat((t_rope, t_pass), dim=-1)
 
         q = apply_rope(q, cos.unsqueeze(1), sin.unsqueeze(1))  # [T, nh, d]

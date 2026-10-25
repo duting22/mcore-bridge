@@ -290,7 +290,13 @@ class TransformerLayer(McoreTransformerLayer):
             if inverse:
                 sin_ = -sin_
 
-            t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
+            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t.numel() > 0:
+                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
+
+                mode = 1 if rotary_interleaved else 0
+                t = npu_rotary_position_embedding(t.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=mode)
+            else:
+                t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
             # Fallback to original permutation
             # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
             # The existing MLA code is safe because the dot product is permutation-invariant.

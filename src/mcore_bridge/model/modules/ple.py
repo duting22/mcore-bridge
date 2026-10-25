@@ -574,19 +574,22 @@ class Qwen4ExpTextPLELayer(nn.Module):
             group_size=self.hidden_size,
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
-            sequence_parallel=config.sequence_parallel)
+            sequence_parallel=config.sequence_parallel,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         self.norm_query = Qwen4ExpTextGroupedRMSNorm(
             hc_hidden_size,
             group_size=self.hidden_size,
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
-            sequence_parallel=config.sequence_parallel)
+            sequence_parallel=config.sequence_parallel,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         self.norm_conv = Qwen4ExpTextGroupedRMSNorm(
             hc_hidden_size,
             group_size=self.hidden_size,
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
-            sequence_parallel=config.sequence_parallel)
+            sequence_parallel=config.sequence_parallel,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         self.conv1d = nn.Conv1d(
             hc_hidden_size,
             hc_hidden_size,
@@ -602,6 +605,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
         self.conv1d.weight.sequence_parallel = config.sequence_parallel
 
     def _short_conv(self, hidden_states: torch.Tensor, packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
+        if (getattr(self.config, 'use_npu_fusion_ple_conv', False) and hidden_states.device.type == 'npu'
+                and hidden_states.numel() > 0 and packed_seq_lens is not None and not self.config.deterministic_mode):
+            return self._short_conv_npu(hidden_states, packed_seq_lens)
         if packed_seq_lens is not None:
             # Only participating samples are present; alignment padding never
             # launches its own convolution when real-sample metadata is available.
@@ -616,6 +622,50 @@ class Qwen4ExpTextPLELayer(nn.Module):
         conv_input = F.pad(hidden_states, (self.short_conv_state_len, 0))
         conv_input = conv_input[..., -(self.short_conv_state_len + sequence_length):]
         return F.silu(self.conv1d(conv_input)).transpose(1, 2)
+
+    def _short_conv_npu(self, hidden_states: torch.Tensor, packed_seq_lens: List[int]) -> torch.Tensor:
+        """Turn dilated convolution into one packed causal convolution without padding."""
+        if get_env_args('FLA_DISABLE_BACKEND_DISPATCH', bool, False):
+            raise RuntimeError('PLE NPU fused convolution requires FLA backend dispatch to be enabled.')
+        # Use the original FLA entry, not MindSpeed's replacement of the convolution re-export.
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+
+        dilation = self.conv1d.dilation[0]
+        total = hidden_states.shape[1]
+        permutation = []
+        sub_cu = [0]
+        start = 0
+        for length in packed_seq_lens:
+            end = start + length
+            # Each residue has independent zero history. Empty residues are omitted.
+            for residue in range(min(dilation, length)):
+                permutation.extend(range(start + residue, end, dilation))
+                sub_cu.append(len(permutation))
+            start = end
+        if start != total:
+            raise ValueError(f'PLE packed lengths sum to {start}, but convolution input length is {total}.')
+
+        inverse = [0] * total
+        for new_position, original_position in enumerate(permutation):
+            inverse[original_position] = new_position
+        device = hidden_states.device
+        permutation = torch.tensor(permutation, dtype=torch.long, device=device)
+        inverse = torch.tensor(inverse, dtype=torch.long, device=device)
+        cu_cpu = torch.tensor(sub_cu, dtype=torch.long)
+        cu = cu_cpu.to(device=device)
+        reordered = hidden_states.index_select(1, permutation)
+        output, _ = causal_conv1d(
+            x=reordered,
+            weight=self.conv1d.weight.squeeze(1),
+            bias=None,
+            initial_state=None,
+            output_final_state=False,
+            activation='silu',
+            backend='triton',
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+        )
+        return output.index_select(1, inverse)
 
     def compute(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
         """Local [B,L,...] projections/norms/gate; communication precedes convolution."""

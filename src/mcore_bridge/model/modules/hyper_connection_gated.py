@@ -27,16 +27,33 @@ def _duplicated_linear(config, input_size: int, output_size: int) -> TELinear:
 
 class Qwen4ExpTextGroupedRMSNorm(nn.Module):
 
-    def __init__(self, dim: int, group_size: int, eps: float = 1e-6, dtype=None, sequence_parallel: bool = False):
+    def __init__(self,
+                 dim: int,
+                 group_size: int,
+                 eps: float = 1e-6,
+                 dtype=None,
+                 sequence_parallel: bool = False,
+                 use_npu_fusion_rmsnorm: bool = False):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype))
         self.group_size = group_size
+        self.use_npu_fusion_rmsnorm = use_npu_fusion_rmsnorm
         if dim % group_size != 0:
             raise ValueError(f'hidden_size ({dim}) must be divisible by group_size ({group_size}).')
         setattr(self.weight, 'sequence_parallel', sequence_parallel)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if self.use_npu_fusion_rmsnorm and x.device.type == 'npu':
+            import torch_npu
+            # Each row is one group. Keep the independent, zero-centered affine
+            # outside the fused norm, with the original FP32 computation order.
+            grouped = x.reshape(-1, self.group_size)
+            weight = torch.ones(self.group_size, dtype=x.dtype, device=x.device)
+            output = torch_npu.npu_rms_norm(grouped, weight, epsilon=self.eps)[0]
+            return output.reshape(x.shape)
         x = x.reshape(*x.shape[:-1], -1, self.group_size)
         out = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return out.flatten(-2)
@@ -74,7 +91,11 @@ class Qwen4ExpTextGatedResidual(nn.Module):
         # (transformers: Qwen4ExpTextRMSNorm(hc_hidden_size, group_size=self.hidden_size,
         #  eps=config.rms_norm_eps); layernorm_epsilon is mcore's rms_norm_eps.)
         self.hc_norm = Qwen4ExpTextGroupedRMSNorm(
-            hc_hidden_size, group_size=self.hidden_size, eps=config.layernorm_epsilon, dtype=config.params_dtype)
+            hc_hidden_size,
+            group_size=self.hidden_size,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
+            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
         self.input_mix_weight_down = _duplicated_linear(config, hc_hidden_size, config.hc_lowrank)
         self.input_mix_weight_up = _duplicated_linear(config, config.hc_lowrank, hc_hidden_size)
         self.block_inject_weight = _duplicated_linear(config, hc_hidden_size, self.hc_count) if use_combine else None

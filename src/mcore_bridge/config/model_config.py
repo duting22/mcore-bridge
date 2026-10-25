@@ -122,6 +122,11 @@ class ModelConfig(TransformerConfig):
     rope_scaling: Optional[Union[dict, str]] = None
     attention_scaling: float = 1.
 
+    # Custom NPU fusion.
+    use_npu_fusion_rmsnorm: bool = False
+    use_npu_fusion_rope: bool = False
+    use_npu_fusion_ple_conv: bool = False
+
     # model
     num_layers: Optional[int] = None
     hidden_size: Optional[int] = None

@@ -87,6 +87,14 @@ class Qwen3NextRMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, hidden_states):
+        if (getattr(self.config, 'use_npu_fusion_rmsnorm', False) and hidden_states.device.type == 'npu'
+                and hidden_states.numel() > 0):
+            import torch_npu
+
+            # Preserve FP32 normalization and zero-centered affine before the final cast.
+            weight = 1.0 + self.weight.float()
+            output = torch_npu.npu_rms_norm(hidden_states.float(), weight, epsilon=self.eps)[0]
+            return output.type_as(hidden_states)
         output = self._norm(hidden_states.float())
         # Zero-Centered: use (1 + weight) instead of weight
         # This matches HuggingFace's Qwen3NextRMSNorm exactly
