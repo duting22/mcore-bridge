@@ -13,18 +13,21 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
 from mcore_bridge.config import ModelConfig
 
-try:
-    from fla.modules.convolution import causal_conv1d
-    from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ImportError:
-    causal_conv1d = None
-    l2norm = None
-    chunk_gated_delta_rule = None
+from .npu_ops import get_npu_gdn_ops, npu_causal_conv1d, npu_gdn_init_context
+
+causal_conv1d = l2norm = chunk_gated_delta_rule = None
+if not is_torch_npu_available():
+    try:
+        from fla.modules.convolution import causal_conv1d
+        from fla.modules.l2norm import l2norm
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError:
+        causal_conv1d = l2norm = chunk_gated_delta_rule = None
 
 try:
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet as _GatedDeltaNet
@@ -101,7 +104,9 @@ class GatedDeltaNet(_GatedDeltaNet):
         if 'cp_comm_type' not in inspect.signature(_GatedDeltaNet).parameters:
             kwargs.pop('cp_comm_type', None)
         try:
-            super().__init__(config, submodules, *args, **kwargs)
+            backend_context = npu_gdn_init_context(_GatedDeltaNet) if is_torch_npu_available() else nullcontext()
+            with backend_context:
+                super().__init__(config, submodules, *args, **kwargs)
         finally:
             if config.linear_decoupled_in_proj:
                 submodules.in_proj = in_proj
@@ -224,6 +229,11 @@ class GatedDeltaNet(_GatedDeltaNet):
             saved_linear_sp = self._set_linear_sequence_parallel(False)
 
         try:
+            if hidden_states.device.type == 'npu':
+                conv_fn = npu_causal_conv1d
+                l2norm_fn, gated_delta_rule_fn = get_npu_gdn_ops()
+            else:
+                conv_fn, l2norm_fn, gated_delta_rule_fn = causal_conv1d, l2norm, chunk_gated_delta_rule
             seq_len, batch, _ = hidden_states.shape
             cp_size = self.config.context_parallel_size
             if use_sp:
@@ -330,8 +340,8 @@ class GatedDeltaNet(_GatedDeltaNet):
                 conv1d_weight = self.conv1d.weight
                 conv1d_bias = self.conv1d.bias
 
-            if (causal_conv1d is None) or self.config.deterministic_mode:
-                assert cu_seqlens is None, 'Packed sequences are not supported when fla is not available.'
+            if (conv_fn is None) or self.config.deterministic_mode:
+                assert cu_seqlens is None, 'Packed sequences require a convolution backend in nondeterministic mode.'
                 qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
                 conv_out = F.conv1d(
                     input=qkv,
@@ -346,7 +356,7 @@ class GatedDeltaNet(_GatedDeltaNet):
                 qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
             else:
                 assert self.activation in ['silu', 'swish']
-                qkv = causal_conv1d(
+                qkv = conv_fn(
                     x=qkv,
                     weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                     bias=conv1d_bias,
@@ -369,8 +379,8 @@ class GatedDeltaNet(_GatedDeltaNet):
             value = value.reshape(batch, seq_len, -1, self.value_head_dim)
             # Apply L2 norm to query and key
             if self.use_qk_l2norm:
-                query = l2norm(query.contiguous())
-                key = l2norm(key.contiguous())
+                query = l2norm_fn(query.contiguous())
+                key = l2norm_fn(key.contiguous())
             if self.num_value_heads // self.num_key_heads > 1:
                 query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
                 key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -408,7 +418,7 @@ class GatedDeltaNet(_GatedDeltaNet):
                     use_qk_l2norm_in_kernel=False,
                 )
             else:
-                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = gated_delta_rule_fn(
                     query,
                     key,
                     value,

@@ -116,6 +116,13 @@ Recommended Runtime Environment:
 | modelscope   | >=1.23       |             |                    |
 | peft         | >=0.11,<0.20 |             |      LoRA          |
 
+For Qwen3.8-Flash-Next (`qwen4_exp`) NPU training with the MCore GDN path,
+convolution and the recurrent core use the MindSpeed/fla-npu training wrappers;
+`flash-linear-attention` and `fla-core` are not required by this bridge path.
+MindSpeed, a matching fla-npu build, and triton-ascend are still required.
+Set `use_npu_fusion_ple_conv=True` to process all PLE packed subsequences in one
+convolution call. This keeps sequence histories separate, including dilation
+residues. The flag defaults to `False`; disabling it retains the torch path.
 
 ## ✨ Model List
 

@@ -22,6 +22,7 @@ from ...utils.megatron_utils import (_thd_partitioned_indices_torch, _undo_atten
                                     get_num_samples, reconstruct_tensor_cp)
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
+from .npu_ops import npu_causal_conv1d
 
 _MASK64 = (1 << 64) - 1
 # Cap the per-all_reduce GPU buffer when exporting the (potentially huge) ngram
@@ -625,11 +626,6 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
     def _short_conv_npu(self, hidden_states: torch.Tensor, packed_seq_lens: List[int]) -> torch.Tensor:
         """Turn dilated convolution into one packed causal convolution without padding."""
-        if get_env_args('FLA_DISABLE_BACKEND_DISPATCH', bool, False):
-            raise RuntimeError('PLE NPU fused convolution requires FLA backend dispatch to be enabled.')
-        # Use the original FLA entry, not MindSpeed's replacement of the convolution re-export.
-        from fla.modules.conv.causal_conv1d import causal_conv1d
-
         dilation = self.conv1d.dilation[0]
         total = hidden_states.shape[1]
         permutation = []
@@ -652,18 +648,14 @@ class Qwen4ExpTextPLELayer(nn.Module):
         permutation = torch.tensor(permutation, dtype=torch.long, device=device)
         inverse = torch.tensor(inverse, dtype=torch.long, device=device)
         cu_cpu = torch.tensor(sub_cu, dtype=torch.long)
-        cu = cu_cpu.to(device=device)
         reordered = hidden_states.index_select(1, permutation)
-        output, _ = causal_conv1d(
+        output, _ = npu_causal_conv1d(
             x=reordered,
             weight=self.conv1d.weight.squeeze(1),
             bias=None,
-            initial_state=None,
-            output_final_state=False,
             activation='silu',
-            backend='triton',
-            cu_seqlens=cu,
-            cu_seqlens_cpu=cu_cpu,
+            # MindSpeed consumes host boundaries; avoid a redundant H2D/D2H.
+            cu_seqlens=cu_cpu,
         )
         return output.index_select(1, inverse)
 
