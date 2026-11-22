@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
+from mcore_bridge.utils.cp_layout import prepare_thd_cp_layout
 
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
@@ -158,6 +159,11 @@ class GPTModel(McoreGPTModel):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
         in_inference_mode = inference_context is not None and not self.training
+        layout_input = decoder_input if decoder_input is not None else position_ids
+        if layout_input is None:
+            layout_input = input_ids
+        prepare_thd_cp_layout(
+            packed_seq_params, self.config, layout_input.device if layout_input is not None else None)
 
         # Decoder embedding.
         if decoder_input is not None:

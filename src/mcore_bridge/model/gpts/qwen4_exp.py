@@ -210,10 +210,10 @@ class Qwen4ExpLayer(TransformerLayer):
             hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         psp_for_cp = None
         if self.config.context_parallel_size > 1:
-            # TE's packed CP partition (thd_get_partitioned_indices) requires
-            # int32 cu; the training pipeline produces int32, but normalize callers
-            # that hand us int64.
-            if packed_seq_params.cu_seqlens_q is not None \
+            # TE needs int32 boundaries. NPU reconstruction uses the shared
+            # Torch layout instead: keep the original int64 tensor there so
+            # each QSA layer does not create a different cache source.
+            if hidden_states.device.type != 'npu' and packed_seq_params.cu_seqlens_q is not None \
                     and packed_seq_params.cu_seqlens_q.dtype != torch.int32:
                 psp_for_cp = copy.copy(packed_seq_params)
                 psp_for_cp.cu_seqlens_q = packed_seq_params.cu_seqlens_q.to(torch.int32)

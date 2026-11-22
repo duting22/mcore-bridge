@@ -10,6 +10,7 @@ from typing import Optional
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import reconstruct_tensor_cp, split_cp_inputs
+from mcore_bridge.utils.cp_layout import prepare_thd_cp_layout
 
 from .gpt_model import GPTModel
 
@@ -101,6 +102,11 @@ class MultimodalGPTModel(MegatronModule):
         runtime_gather_output: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
+        layout_input = input_ids if input_ids is not None else position_ids
+        if layout_input is None:
+            layout_input = decoder_input
+        prepare_thd_cp_layout(
+            packed_seq_params, self.config, layout_input.device if layout_input is not None else None)
         inference_context = kwargs.pop('inference_context', None)
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys if k in kwargs}
         # Compatible with legacy mcore-bridge behavior.

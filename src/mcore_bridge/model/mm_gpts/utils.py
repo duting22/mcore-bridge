@@ -112,6 +112,11 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
         dtype = visual.dtype
         vision_config = HuggingFaceVit._get_vision_config(hf_config)
         if pixel_values is None and pixel_values_videos is None:  # plain-text
+            # A frozen visual (including its merger/adapters) needs no dummy
+            # graph. Trainable visual parameters still take the original path
+            # to preserve distributed gradient hooks on text-only microbatches.
+            if not any(param.requires_grad for param in visual.parameters()):
+                return inputs_embeds
             hidden_size = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
             pixel_values = torch.zeros(16 * 16, hidden_size, dtype=dtype, device=input_ids.device)
             image_grid_thw = input_ids.new_tensor([[1, 16, 16]])

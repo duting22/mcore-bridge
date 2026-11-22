@@ -18,8 +18,9 @@ from typing import List, Optional
 
 from ...utils import get_env_args, get_logger
 from ...utils.constants import EXPORT_CHUNK_BYTES
-from ...utils.megatron_utils import (_thd_partitioned_indices_torch, _undo_attention_load_balancing_thd_torch,
-                                    get_num_samples, reconstruct_tensor_cp)
+from ...utils.cp_layout import get_thd_cp_layout
+from ...utils.megatron_utils import (_undo_attention_load_balancing_thd_torch, get_num_samples,
+                                    reconstruct_tensor_cp)
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
 from .npu_ops import npu_causal_conv1d
@@ -728,6 +729,10 @@ class Qwen4ExpTextPLELayer(nn.Module):
         sp_size = self.tp_group.size() if self.config.sequence_parallel else 1
         cp_size = self.cp_group.size()
         total = hidden_states.shape[0] * sp_size * cp_size
+        # Initialize on the original object before copying it, including when
+        # PLE is invoked directly rather than through the model entry point.
+        layout = get_thd_cp_layout(
+            packed_seq_params, cp_size, hidden_states.device, padded=False, total_tokens=total) if cp_size > 1 else None
         # Keep dynamically attached num_samples/seq_lens while aligning both boundary views.
         psp = copy.copy(packed_seq_params)
         psp.cu_seqlens_q = self._normalize_cu_seqlens(psp.cu_seqlens_q, total)
@@ -740,12 +745,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
                 raise ValueError(f'PLE input_ids length {input_ids.shape[1]} does not match full length {total} '
                                  f'or CP-local length {total // cp_size}.')
         if cp_size > 1:
-            indices = _thd_partitioned_indices_torch(
-                psp.cu_seqlens_q, cp_size, self.cp_group.rank(), hidden_states.device)
+            indices = layout.local_indices(
+                self.cp_group.rank(), sp_size, self.tp_group.rank() if sp_size > 1 else 0)
         else:
             indices = torch.arange(total, device=hidden_states.device)
-        if sp_size > 1:
-            indices = indices.narrow(0, self.tp_group.rank() * hidden_states.shape[0], hidden_states.shape[0])
+            if sp_size > 1:
+                indices = indices.narrow(0, self.tp_group.rank() * hidden_states.shape[0], hidden_states.shape[0])
         return input_ids, psp, packed_seq_lens, indices
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params=None) -> torch.Tensor:

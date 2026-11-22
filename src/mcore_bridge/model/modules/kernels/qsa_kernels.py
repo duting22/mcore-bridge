@@ -32,6 +32,7 @@ import os
 import torch
 
 from mcore_bridge.utils import get_env_args, get_logger
+from mcore_bridge.utils.cp_layout import get_thd_cp_layout
 
 from .qsa_block_sparse_attn import qsa_sparse_attention_from_indices
 
@@ -96,28 +97,6 @@ def _cp_query_global_positions(seq_len: int, cp_size: int, cp_rank: int, device)
     back_chunk = 2 * cp_size - cp_rank - 1
     back = torch.arange(back_chunk * chunk, (back_chunk + 1) * chunk, device=device, dtype=torch.int64)
     return torch.cat((front, back), dim=0)
-
-
-def _cp_query_global_positions_thd(cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, device) -> torch.Tensor:
-    """Local packed-token positions per sample under zigzag thd CP sharding.
-
-    Each sample is padded to a multiple of ``2 * cp_size`` by the data pipeline;
-    the rank owns the ``cp_rank``-th front chunk and the mirrored back chunk of
-    every sample (the same partition ``split_cp_inputs`` applies per sample).
-    """
-    cu = cu_seqlens.to(device=device, dtype=torch.int64)
-    starts, ends = cu[:-1], cu[1:]
-    half = (ends - starts) // (2 * cp_size)  # per-sample chunk length
-    # front chunk cp_rank; back chunk (2*cp-1-cp_rank), whose start is
-    # ends - (cp_rank+1)*half since it is the (cp_rank+1)-th chunk from the end
-    seg_starts = torch.stack((starts + cp_rank * half, ends - (cp_rank + 1) * half), dim=1).reshape(-1)
-    seg_lens = torch.stack((half, half), dim=1).reshape(-1)
-    nz = seg_lens > 0
-    seg_starts, seg_lens = seg_starts[nz], seg_lens[nz]
-    seg_ids = torch.repeat_interleave(torch.arange(seg_lens.numel(), device=device), seg_lens)
-    offsets = torch.arange(int(seg_lens.sum().item()), device=device)
-    offsets = offsets - torch.repeat_interleave(torch.cumsum(seg_lens, 0) - seg_lens, seg_lens)
-    return seg_starts.index_select(0, seg_ids) + offsets
 
 
 def _cp_gathered_to_logical_order(seq_len: int, cp_size: int, device) -> torch.Tensor:
@@ -273,16 +252,12 @@ class QSASparseCoreAttention(torch.nn.Module):
         device = query.device
         thd = query.dim() == 3
         if thd:
-            # the gathered k/v live in the padded pack space, so the query
-            # positions must come from the padded cu as well
-            cu_q = (
-                packed_seq_params.cu_seqlens_q_padded
-                if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q)
-            q_pos = _cp_query_global_positions_thd(cu_q, cp_size, cp_rank, device)
-            # rank-major gathered positions -> permutation back to global packed
-            # order (same construction as mcore DSA's packed kv reorder)
-            gathered_pos = torch.cat([_cp_query_global_positions_thd(cu_q, cp_size, r, device) for r in range(cp_size)])
-            kv_reorder = torch.argsort(gathered_pos)
+            # The gathered k/v use padded pack positions, shared with PLE and
+            # CP reconstruction. Only index construction is cached.
+            layout = get_thd_cp_layout(
+                packed_seq_params, cp_size, device, total_tokens=query.shape[0] * cp_size)
+            q_pos = layout.local_indices(cp_rank)
+            kv_reorder = layout.restore_order
         else:
             sq, b = query.shape[0], query.shape[1]
             q_pos = _cp_query_global_positions(sq * cp_size, cp_size, cp_rank, device)
