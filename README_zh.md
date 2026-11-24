@@ -386,6 +386,20 @@ print(f'loss: {loss}')  # loss: 0.8161308169364929
 
 
 
+## Qwen3.8-Flash-Next NPU 融合算子（可选）
+
+QHC 融合默认关闭，启动训练 worker 前设置。仅支持 NPU 全参 BF16 路径：
+
+```bash
+export NPU_QHC_FUSED=1
+```
+
+- `NPU_QHC_FUSED`：HC 的 grouped RMSNorm、mix 和 injection gate 使用 Triton，投影仍调用原生 GEMM；覆盖最终 mixer 和 MTP。使用现有权重，保持参数名称和 checkpoint 格式。
+
+源码移植自 MindSpeed-MM `f742843`，无需安装完整 MindSpeed-MM 或 FLA。需要现有的 PyTorch、torch_npu、Triton-Ascend 环境；A3/A5 的编译及精度、性能需在实际环境验证。QHC 在 LoRA/自定义模块或 forward hooks、FP8/FP4、融合权重梯度累加配置下使用原路径。其他不支持的 dtype/布局同样使用原路径并提示一次；支持范围内的导入、编译和执行错误会直接抛出。
+
+开关关闭时不导入新增 Triton kernel，GPU/CPU 使用原路径。实际命中会输出一次使用信息；没有命中信息时请检查回退原因。残差回注和 GDN gated norm 的实验融合实现已因 A5 整网耗时增加而移除，继续使用原实现。kernel、框架和编译器版本应与性能结果一起记录。
+
 ## 🏛 License
 
 本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-bridge/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。

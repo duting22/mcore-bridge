@@ -5,6 +5,8 @@ from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
 from typing import Tuple
 
+from .npu_fusions import try_qhc
+
 
 def _duplicated_linear(config, input_size: int, output_size: int) -> TELinear:
     """Replicated projection: TELinear so LoRA can wrap it.
@@ -108,6 +110,9 @@ class Qwen4ExpTextGatedResidual(nn.Module):
         if hyper_input.shape[-1] != self.hc_count * self.hidden_size:
             raise ValueError(f'Expected {self.hc_count * self.hidden_size} hyper-connection features, '
                              f'got {hyper_input.shape[-1]}.')
+        fused = try_qhc(self, hyper_input)
+        if fused is not None:
+            return fused
         hyper_input_normed = self.hc_norm(hyper_input)
         # TELinear returns (output, bias); bias is None here (bias=False). The two
         # linears stay outside the compiled helpers: TE modules do work inside a
