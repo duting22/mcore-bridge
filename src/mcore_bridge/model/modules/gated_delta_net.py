@@ -17,9 +17,12 @@ from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
 from mcore_bridge.config import ModelConfig
+from mcore_bridge.utils import get_logger
+from mcore_bridge.utils.packed_metadata import get_packed_metadata
 
 from .npu_ops import get_npu_gdn_ops, npu_causal_conv1d, npu_gdn_init_context
 
+logger = get_logger()
 causal_conv1d = l2norm = chunk_gated_delta_rule = None
 if not is_torch_npu_available():
     try:
@@ -37,7 +40,9 @@ except ImportError:
 
 
 # Code borrowed from NVIDIA/Megatron-LM
-def _unpack_sequence(x, cu_seqlens, dim=1):
+def _unpack_sequence(x, cu_seqlens, dim=1, slices=None):
+    if slices is not None:
+        return [x[tuple([slice(None)] * dim + [slice(start, end)])] for start, end in slices]
     unpacked_x = []
     num_seqs = cu_seqlens.shape[0] - 1
     for i in range(num_seqs):
@@ -249,16 +254,34 @@ class GatedDeltaNet(_GatedDeltaNet):
                 raise NotImplementedError('GDN does not support inference for now.')
 
             cu_seqlens = None
+            packed_metadata = None
             if packed_seq_params is not None:
                 total_seq_len = seq_len
-                cu_seqlens = self._resolve_cu_seqlens(
-                    getattr(packed_seq_params, 'cu_seqlens_q_padded', None),
-                    packed_seq_params.cu_seqlens_q,
-                    total_seq_len,
-                    cp_size=cp_size,
-                )
-                if cu_seqlens is None:
-                    cu_seqlens = packed_seq_params.cu_seqlens_q
+                if (hidden_states.device.type == 'npu'
+                        and getattr(packed_seq_params, 'qkv_format', None) == 'thd'
+                        and (getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None
+                             or packed_seq_params.cu_seqlens_q is not None)):
+                    packed_metadata = get_packed_metadata(packed_seq_params, total_seq_len)
+                    if not packed_metadata.validate(total_seq_len, cp_size):
+                        # Match the original resolver's fallback to actual, unnormalized boundaries.
+                        packed_metadata = (get_packed_metadata(packed_seq_params, padded=False)
+                                           if packed_seq_params.cu_seqlens_q is not None else None)
+                    cu_seqlens = packed_metadata.cu if packed_metadata is not None else None
+                    try:
+                        from mindspeed.core.ssm.ops.packed_sequence_metadata import get_packed_sequence_metadata
+                    except ImportError:
+                        # Older MindSpeed works unchanged; it cannot share the host snapshot.
+                        get_packed_sequence_metadata = None
+                        logger.warning_once('MindSpeed packed metadata cache is unavailable; '
+                                            'only bridge metadata will be reused. Apply the matching MindSpeed patch.')
+                    if get_packed_sequence_metadata is not None and packed_metadata is not None:
+                        get_packed_sequence_metadata(cu_seqlens, packed_metadata.bounds)
+                else:
+                    cu_seqlens = self._resolve_cu_seqlens(
+                        getattr(packed_seq_params, 'cu_seqlens_q_padded', None),
+                        packed_seq_params.cu_seqlens_q, total_seq_len, cp_size=cp_size)
+                    if cu_seqlens is None:
+                        cu_seqlens = packed_seq_params.cu_seqlens_q
             # Input projection
             num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
             nvtx_range_push(suffix='in_proj')
@@ -283,7 +306,9 @@ class GatedDeltaNet(_GatedDeltaNet):
             if cp_size > 1:
                 from megatron.core.ssm.gated_delta_net import tensor_a2a_cp2hp, tensor_a2a_hp2cp
                 if cu_seqlens is not None:
-                    unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens // self.cp_size, dim=0)
+                    unpacked_qkvzba = _unpack_sequence(
+                        qkvzba, cu_seqlens if packed_metadata is not None else cu_seqlens // self.cp_size,
+                        dim=0, slices=packed_metadata.local_slices(self.cp_size) if packed_metadata is not None else None)
                     outputs = []
                     for qkvzba_i in unpacked_qkvzba:
                         qkvzba_i = tensor_a2a_cp2hp(
@@ -442,7 +467,9 @@ class GatedDeltaNet(_GatedDeltaNet):
             norm_out = norm_out.transpose(0, 1).contiguous()
             if cp_size > 1:
                 if cu_seqlens is not None:
-                    unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens, dim=0)
+                    unpacked_norm_out = _unpack_sequence(
+                        norm_out, cu_seqlens, dim=0,
+                        slices=packed_metadata.slices if packed_metadata is not None else None)
                     outputs = []
                     for norm_out_i in unpacked_norm_out:
                         norm_out_i = tensor_a2a_hp2cp(

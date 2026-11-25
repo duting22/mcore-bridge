@@ -6,6 +6,7 @@ cannot encode different content-dependent selections for multiple documents.
 """
 import torch
 
+from mcore_bridge.utils.packed_metadata import get_packed_metadata
 
 def packed_document_boundaries(packed_seq_params, total):
     """Use the same physical token space as Qwen4ExpLayer's packed selector."""
@@ -14,6 +15,11 @@ def packed_document_boundaries(packed_seq_params, total):
         cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
     if cu is None:
         raise ValueError('Packed QSA needs cu_seqlens_q or cu_seqlens_q_padded.')
+    if isinstance(cu, torch.Tensor) and cu.device.type == 'npu':
+        metadata = get_packed_metadata(packed_seq_params, total)
+        if not metadata.validate(total):
+            raise ValueError(f'Cannot align packed QSA boundaries {metadata.bounds} with T={total}.')
+        return metadata.bounds
     bounds = cu.reshape(-1).tolist() if isinstance(cu, torch.Tensor) else list(cu)
     if bounds and bounds[0] != 0:
         if bounds[-1] == total:

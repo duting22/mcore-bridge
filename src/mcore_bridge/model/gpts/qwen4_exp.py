@@ -255,10 +255,20 @@ class Qwen4ExpLayer(TransformerLayer):
         if cu is None:
             raise RuntimeError('QSA thd selection needs packed_seq_params.cu_seqlens_q to find document '
                                'boundaries, but it is missing.')
-        cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
+        metadata = None
+        if hidden_states.device.type == 'npu':
+            from mcore_bridge.utils.packed_metadata import get_packed_metadata
+
+            metadata = get_packed_metadata(packed_seq_params, hidden_states.shape[0])
+            if not metadata.validate(hidden_states.shape[0]):
+                raise ValueError('QSA cannot align packed document boundaries with the reconstructed token count.')
+            cu = metadata.cu
+        else:
+            cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
         hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
         return self.self_attention.indexer.select_token_indices_thd(
-            hidden_tok, freqs, cu, force_materialize=self.config.context_parallel_size > 1)
+            hidden_tok, freqs, cu, force_materialize=self.config.context_parallel_size > 1,
+            packed_metadata=metadata)
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # Bool-mask QSA on TE's `arbitrary` mask. Only reached for sbhd with CP==1 --

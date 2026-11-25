@@ -1,31 +1,20 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Microbatch-owned THD context-parallel index layouts; no activation caching."""
+"""THD context-parallel layout algorithms; PackedMetadata owns cached instances."""
 import torch
 
-
-def _boundary_key(cu):
-    if cu is None:
-        return None
-    try:
-        version = cu._version
-    except RuntimeError:
-        # Inference tensors have no version counter. Do not reuse a layout whose
-        # source can change without us being able to detect it.
-        return None
-    shape = (cu.numel(),) if cu.is_contiguous() else (tuple(cu.shape), tuple(cu.stride()))
-    return (cu.untyped_storage()._cdata, cu.storage_offset(), shape, cu.dtype, cu.device, version)
+from .packed_metadata import get_packed_metadata
 
 
-def _thd_partitioned_indices_torch(cu_seqlens, cp_size, cp_rank, device, total_tokens=None):
+def _thd_partitioned_indices_torch(cu_seqlens, cp_size, cp_rank, device, total_tokens=None, host_bounds=None):
     """Build all ranks in one batch when cp_rank is None, otherwise return one rank.
 
     Host validation and the explicit repeat_interleave output size avoid the
     repeated device scalar reads and dynamic output-size inference of the old
-    per-rank implementation. Host boundaries are temporary, not cached.
+    per-rank implementation. NPU callers share the microbatch's host boundaries.
     """
     if cp_size < 1 or (cp_rank is not None and not 0 <= cp_rank < cp_size):
         raise ValueError('Invalid THD context-parallel size or rank.')
-    bounds = cu_seqlens.detach().reshape(-1).cpu().tolist()
+    bounds = host_bounds if host_bounds is not None else cu_seqlens.detach().reshape(-1).cpu().tolist()
     if bounds and bounds[0] != 0 and total_tokens is not None:
         if bounds[-1] == total_tokens:
             bounds = [0, *bounds]
@@ -89,52 +78,21 @@ class THDCPLayout:
         return self._local_indices[key]
 
 
-class _LayoutCache:
-
-    def __init__(self, sources, signature):
-        # Keep sources alive so storage identities cannot be recycled while
-        # entries are alive. Shallow PackedSeqParams copies share this object.
-        self.sources = sources
-        self.signature = signature
-        self.layouts = {}
-
-
 def get_thd_cp_layout(packed_seq_params, cp_size, device, *, padded=True, total_tokens=None,
                       index_dtype=torch.long):
-    """Return the microbatch's cached CP layout, rebuilding after source mutation.
-
-    Equivalent contiguous boundary views share a storage/version key. Actual
-    and padded boundaries are separate unless they alias the same source.
-    """
+    """Query the shared packed cache; retain the existing CP normalization contract."""
     if index_dtype != torch.long:
         # scatter/index_select consumers in this path use int64 indices.
         raise ValueError('THD CP layout indices must have dtype torch.long.')
-    actual = packed_seq_params.cu_seqlens_q
-    padded_cu = getattr(packed_seq_params, 'cu_seqlens_q_padded', None)
-    sources = (actual, padded_cu)
-    cu = padded_cu if padded and padded_cu is not None else actual
+    cu = getattr(packed_seq_params, 'cu_seqlens_q_padded', None) if padded else None
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
     if cu is None:
         raise RuntimeError('THD CP requires cu_seqlens_q or cu_seqlens_q_padded.')
-    signature = tuple(_boundary_key(source) for source in sources)
-    reusable = all(source is None or key is not None for source, key in zip(sources, signature))
-    cache = getattr(packed_seq_params, '_bridge_thd_cp_cache', None)
-    if not reusable or cache is None or cache.signature != signature:
-        cache = _LayoutCache(sources, signature)
-        packed_seq_params._bridge_thd_cp_cache = cache
-    device = torch.device(device)
-    key = (_boundary_key(cu), cp_size, device, index_dtype, total_tokens)
-    # Eager preparation and consumers with a known tensor length share an entry.
-    if key not in cache.layouts:
-        for existing_key, layout in cache.layouts.items():
-            if existing_key[:4] == key[:4] and (total_tokens is None or layout.total_tokens == total_tokens):
-                return layout
-    if key not in cache.layouts:
-        # Cached indices must remain usable by autograd even when first built
-        # in a no-grad checkpoint forward or an inference_mode context.
-        with torch.inference_mode(False), torch.no_grad():
-            positions = _thd_partitioned_indices_torch(cu, cp_size, None, device, total_tokens)
-            cache.layouts[key] = THDCPLayout(positions)
-    return cache.layouts[key]
+    # Keep source boundaries unnormalized here. CP applies total_tokens itself,
+    # so known-length and eager queries retain their original sharing behavior.
+    metadata = get_packed_metadata(packed_seq_params, padded=padded)
+    return metadata.cp_layout(cp_size, device, total_tokens=total_tokens, index_dtype=index_dtype)
 
 
 def prepare_thd_cp_layout(packed_seq_params, config, device):

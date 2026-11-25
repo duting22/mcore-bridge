@@ -68,7 +68,7 @@ def _stable_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _score_packed_blocks(q, block_keys, cu_seqlens, compress_ratio, block_topk):
+def _score_packed_blocks(q, block_keys, cu_seqlens, compress_ratio, block_topk, packed_metadata=None):
     """Score each packed document against its own complete blocks.
 
     Return pack-space block IDs with the same padded width as global scoring.
@@ -79,22 +79,24 @@ def _score_packed_blocks(q, block_keys, cu_seqlens, compress_ratio, block_topk):
     k = min(block_topk, block_keys.shape[0])
     top_blocks = torch.zeros(total, k, dtype=torch.long, device=q.device)
     keep = torch.zeros(total, k, dtype=torch.bool, device=q.device)
-    boundaries = cu_seqlens.tolist()
+    boundaries = packed_metadata.bounds if packed_metadata is not None else cu_seqlens.tolist()
     block_start = 0
     scale = math.sqrt(dim)
-    for doc_start, doc_end in zip(boundaries, boundaries[1:]):
+    for doc, (doc_start, doc_end) in enumerate(zip(boundaries, boundaries[1:])):
         blocks = (doc_end - doc_start) // compress_ratio
         block_end = block_start + blocks
         if blocks and k:
             local_k = min(k, blocks)
             keys = block_keys[block_start:block_end].float()
-            block_ids = torch.arange(blocks, device=q.device)
+            block_ids = (packed_metadata.block_ids[doc] if packed_metadata is not None
+                         else torch.arange(blocks, device=q.device))
             chunk = max(1, _QSA_INDEX_SCORE_CHUNK_BYTES // (heads * blocks * 4))
             for start in range(doc_start, doc_end, chunk):
                 end = min(start + chunk, doc_end)
                 scores = torch.einsum('thd,kd->thk', q[start:end].float(), keys)
                 scores = torch.relu(scores).sum(dim=1) / scale
-                visible = (torch.arange(start, end, device=q.device) - doc_start + 1) // compress_ratio
+                visible = (packed_metadata.visible_blocks[start:end] if packed_metadata is not None
+                           else (torch.arange(start, end, device=q.device) - doc_start + 1) // compress_ratio)
                 valid = block_ids[None, :] < visible[:, None]
                 scores.masked_fill_(~valid, float('-inf'))
                 selected = _stable_topk_indices(scores, local_k)
@@ -357,7 +359,8 @@ class QSAIndexer(nn.Module):
                                  hidden_tok: torch.Tensor,
                                  freqs: torch.Tensor,
                                  cu_seqlens: torch.Tensor,
-                                 force_materialize: bool = False) -> torch.Tensor:
+                                 force_materialize: bool = False,
+                                 packed_metadata=None) -> torch.Tensor:
         """QSA selection for packed (thd) inputs, indices in pack space.
 
         A standalone implementation: it does *not* call
@@ -388,15 +391,27 @@ class QSAIndexer(nn.Module):
         T, _ = hidden_tok.shape
         R = self.compress_ratio
         device = hidden_tok.device
-        doc_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()  # [D]
-        D = doc_lens.numel()
-        full_blocks = doc_lens // R  # complete R-blocks per document
-        if not force_materialize and int(full_blocks.max().item()) <= self.block_topk:
+        if packed_metadata is not None and not force_materialize \
+                and max((length // R for length in packed_metadata.lengths), default=0) <= self.block_topk:
+            return None
+        layout = packed_metadata.qsa(R, device) if packed_metadata is not None else None
+        if layout is not None:
+            full_blocks = layout.full_blocks
+            max_blocks = layout.max_blocks
+        else:
+            doc_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()  # [D]
+            D = doc_lens.numel()
+            full_blocks = doc_lens // R
+            max_blocks = int(full_blocks.max().item()) if not force_materialize else 0
+        if not force_materialize and max_blocks <= self.block_topk:
             return None
 
         # ---- per-token document id / in-doc position ----
-        token_doc = torch.repeat_interleave(torch.arange(D, device=device), doc_lens)  # [T]
-        pos_in_doc = torch.arange(T, device=device) - cu_seqlens[token_doc].long()  # [T]
+        if layout is not None:
+            token_doc, pos_in_doc = layout.token_doc, layout.pos_in_doc
+        else:
+            token_doc = torch.repeat_interleave(torch.arange(D, device=device), doc_lens)  # [T]
+            pos_in_doc = torch.arange(T, device=device) - cu_seqlens[token_doc].long()  # [T]
 
         # ---- project to indexer q/k ----
         qk = self.index_qk_proj(hidden_tok)[0]
@@ -435,38 +450,44 @@ class QSAIndexer(nn.Module):
         q = apply_rope(q, cos.unsqueeze(1), sin.unsqueeze(1))  # [T, nh, d]
 
         # ---- pool complete blocks in pack space (shared across queries) ----
-        NB = int(full_blocks.sum().item())
-        token_in_full = pos_in_doc < (full_blocks * R)[token_doc]  # [T]
-        block_in_doc = pos_in_doc // R  # [T]
-        block_offset = torch.cumsum(full_blocks, 0) - full_blocks  # exclusive [D]
-        global_block = block_offset[token_doc] + block_in_doc  # [T]
+        NB = layout.num_blocks if layout is not None else int(full_blocks.sum().item())
 
         pooled_sum = torch.zeros(NB, self.index_head_dim, device=device, dtype=torch.float32)
-        gb = global_block[token_in_full]
-        pooled_sum.index_add_(0, gb, raw_keys[token_in_full].float())
+        if layout is not None:
+            pooled_sum.index_add_(0, layout.full_block_ids, raw_keys.index_select(0, layout.full_rows).float())
+        else:
+            token_in_full = pos_in_doc < (full_blocks * R)[token_doc]  # [T]
+            block_in_doc = pos_in_doc // R
+            block_offset = torch.cumsum(full_blocks, 0) - full_blocks
+            global_block = block_offset[token_doc] + block_in_doc
+            pooled_sum.index_add_(0, global_block[token_in_full], raw_keys[token_in_full].float())
         pooled = (pooled_sum / R).to(raw_keys.dtype)  # exactly R tokens per full block
         pooled = self.k_layernorm(pooled)  # [NB, d]
 
         # blocks rotate at their first token's in-doc position
-        block_doc = torch.repeat_interleave(torch.arange(D, device=device), full_blocks)  # [NB]
-        block_in_doc_idx = torch.arange(NB, device=device) - block_offset[block_doc]  # [NB]
-        first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
+        if layout is not None:
+            first_pack = layout.first_pack
+        else:
+            block_doc = torch.repeat_interleave(torch.arange(D, device=device), full_blocks)  # [NB]
+            block_in_doc_idx = torch.arange(NB, device=device) - block_offset[block_doc]  # [NB]
+            first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R
         block_keys = apply_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
 
         # ---- score only in-document blocks, chunked over queries ----
-        q_nblocks = (pos_in_doc + 1) // R  # [T]
+        q_nblocks = layout.visible_blocks if layout is not None else (pos_in_doc + 1) // R
         if self.indexer_backend == 'ascendc':
             from .kernels.qsa_npu_indexer import lightning_topk_blocks
             k = min(self.block_topk, NB)
             top_blocks, keep = lightning_topk_blocks(
-                q, block_keys, cu_seqlens, full_blocks, q_nblocks, k, R, _QSA_INDEX_SCORE_CHUNK_BYTES)
+                q, block_keys, cu_seqlens, full_blocks, q_nblocks, k, R, _QSA_INDEX_SCORE_CHUNK_BYTES,
+                packed_metadata=layout)
         else:
-            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk, layout)
             k = top_blocks.shape[1]
 
         # ---- top-k blocks -> token indices ----
         arange_r = torch.arange(R, device=device)
-        base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R  # [T, k]
+        base = first_pack[top_blocks]  # [T,k], static pack-space start for each selected block
         top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)  # [T, k*R]
         top_keep = keep.unsqueeze(-1).expand(-1, -1, R).reshape(T, k * R)
         top_idx = torch.where(top_keep, top_idx, top_idx.new_full((), -1))
