@@ -24,6 +24,7 @@ from ...utils.megatron_utils import (_undo_attention_load_balancing_thd_torch, g
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
 from .npu_ops import npu_causal_conv1d
+from .ple_halo import exchange_left_halo
 
 _MASK64 = (1 << 64) - 1
 # Cap the per-all_reduce GPU buffer when exporting the (potentially huge) ngram
@@ -535,6 +536,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def __init__(self, config, ple_layer_index: int, pg_collection=None):
         super().__init__()
         self.config = config
+        self._halo_conv_enabled = get_env_args('PLE_HALO_CONV', bool, False)
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp if pg_collection is not None else parallel_state.get_tensor_model_parallel_group()
         self.cp_group = parallel_state.get_context_parallel_group()
@@ -660,6 +662,67 @@ class Qwen4ExpTextPLELayer(nn.Module):
         )
         return output.index_select(1, inverse)
 
+    def _halo_conv_fallback_reason(self, hidden_states):
+        if hidden_states.device.type != 'npu':
+            return 'requires NPU tensors'
+        if self.cp_group.size() != 1:
+            return 'requires CP=1'
+        if not self.config.sequence_parallel or self.tp_group.size() <= 1:
+            return 'requires TP>1 and sequence parallelism'
+        if self.config.deterministic_mode or not getattr(self.config, 'use_npu_fusion_ple_conv', False):
+            return 'requires the nondeterministic NPU packed convolution backend'
+        if hidden_states.shape[1] < max(1, self.short_conv_state_len):
+            # SP chunks have equal physical lengths, so every TP rank takes the
+            # same fallback before any P2P operation is issued.
+            return 'local sequence shard is shorter than the halo'
+        return None
+
+    def _short_conv_halo(self, hidden_states, packed_seq_lens):
+        """Convolve only this contiguous SP shard, with same-document left history."""
+        halo = self.short_conv_state_len
+        length = hidden_states.shape[1]
+        base = self.tp_group.rank() * length
+        if halo:
+            history = exchange_left_halo(hidden_states[:, -halo:], self.tp_group)
+        else:
+            history = None
+
+        pieces, lengths = [], []
+        start = 0
+        prefix = 0
+        for document_length in packed_seq_lens:
+            end = start + document_length
+            left, right = max(base, start), min(base + length, end)
+            if left < right:
+                if not pieces:
+                    prefix = min(halo, left - start)
+                    if prefix:
+                        pieces.append(history[:, halo - prefix:])
+                pieces.append(hidden_states[:, left - base:right - base])
+                lengths.append(right - left + (prefix if len(lengths) == 0 else 0))
+            start = end
+            if start >= base + length:
+                break
+
+        if not pieces:
+            # Match the old path's zero gradients and parameter hooks even
+            # when this rank has no participating convolution outputs.
+            dependency = hidden_states[:, :0].sum() + self.conv1d.weight[:0].sum()
+            if history is not None:
+                dependency = dependency + history[:, :0].sum()
+            return torch.zeros_like(hidden_states) + dependency
+
+        packed = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
+        convolved = self._short_conv(packed, packed_seq_lens=lengths)[:, prefix:]
+        if convolved.shape[1] < length:
+            convolved = F.pad(convolved, (0, 0, 0, length - convolved.shape[1]))
+        if history is not None and prefix == 0:
+            # Rank zero and document-aligned shards still owe their right
+            # neighbour a backward. An empty sum keeps that edge without
+            # reading unused history values or risking FP16 overflow.
+            convolved = convolved + history[:, :0].sum()
+        return convolved
+
     def compute(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
         """Local [B,L,...] projections/norms/gate; communication precedes convolution."""
         key_normed = self.norm_key(self.key_proj(embeddings)[0]).unflatten(-1, (self.hc_count, self.hidden_size))
@@ -754,13 +817,23 @@ class Qwen4ExpTextPLELayer(nn.Module):
         return input_ids, psp, packed_seq_lens, indices
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
-        """THD: keep hidden/projections local; gather only normalized conv inputs."""
+        """THD: local projections, with full gathering or opt-in SP halo convolution."""
         input_ids, psp, packed_seq_lens, local_indices = self._prepare_local_layout(
             hidden_states, input_ids, packed_seq_params)
         real_end = sum(packed_seq_lens)
         total = input_ids.shape[1]
         embeddings = self.ple_embedding(input_ids, packed_seq_lens, local_token_indices=local_indices)
         gated_value, gated_value_normed = self.compute(hidden_states.transpose(0, 1), embeddings)
+        if self._halo_conv_enabled:
+            reason = self._halo_conv_fallback_reason(gated_value_normed)
+            if reason is None:
+                get_logger().info_once('PLE_HALO_CONV=1: using adjacent TP halo exchange '
+                                       f'(CP=1, TP={self.tp_group.size()}, halo={self.short_conv_state_len}).')
+                local_conv = self._short_conv_halo(gated_value_normed, packed_seq_lens)
+                output = gated_value + local_conv
+                output = output.masked_fill((local_indices >= real_end).view(1, -1, 1), 0)
+                return output.transpose(0, 1).contiguous()
+            get_logger().warning_once(f'PLE_HALO_CONV=1: keeping full convolution path: {reason}.')
         # Megatron gathers DIMENSION ZERO: never pass batch-first [B,L,H] here.
         full_normed = gated_value_normed.transpose(0, 1).contiguous()
         if self.config.sequence_parallel and self.tp_group.size() > 1:
